@@ -2,7 +2,10 @@
 import io
 import os
 import re
+import shutil
+import sys
 import tempfile
+from collections import Counter
 
 try:
     import pymupdf as fitz
@@ -122,51 +125,93 @@ def find_bad_fonts(doc, page_numbers, force=False):
 
 
 # ---------------------------------------------------------------- OCR
+def _base_dir():
+    return getattr(sys, "_MEIPASS", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def find_tesseract():
+    cands = [os.environ.get("TESSERACT_CMD"),
+             os.path.join(_base_dir(), "tesseract", "tesseract.exe"),
+             os.path.join(os.path.dirname(sys.executable), "tesseract", "tesseract.exe"),
+             r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+             shutil.which("tesseract")]
+    for c in cands:
+        if c and os.path.exists(c):
+            return c
+    return None
+
+
+def clean_crop(img):
+    """Tek satırlık yazı kırpığını Tesseract için hazırlar: gri, koyu yazı/açık zemin, tablo çizgileri silinir."""
+    import cv2
+    g = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    if np.median(g) < 128:  # koyu zeminde açık yazı (ör. kırmızı başlık)
+        g = 255 - g
+    _, bw = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    h, w = bw.shape
+    hk = cv2.getStructuringElement(cv2.MORPH_RECT, (max(15, int(w * 0.6)), 1))
+    vk = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(15, int(h * 0.7))))
+    lines = cv2.bitwise_or(cv2.morphologyEx(bw, cv2.MORPH_OPEN, hk), cv2.morphologyEx(bw, cv2.MORPH_OPEN, vk))
+    lines = cv2.dilate(lines, np.ones((3, 3), np.uint8))
+    g = g.copy()
+    g[lines > 0] = 255
+    return np.pad(g, 12, constant_values=255)
+
+
 class OCR:
-    def __init__(self):
+    def __init__(self, lang="eng"):
         self.eng = None
         self.kind = None
+        self.lang = lang
 
     def load(self):
         if self.eng:
             return
         err = None
         try:
-            from rapidocr_onnxruntime import RapidOCR
-            self.eng, self.kind = RapidOCR(), "rapid"
+            import pytesseract
+            cmd = find_tesseract()
+            if cmd:
+                pytesseract.pytesseract.tesseract_cmd = cmd
+                td = os.path.join(os.path.dirname(cmd), "tessdata")
+                if os.path.isdir(td):
+                    os.environ["TESSDATA_PREFIX"] = td
+            pytesseract.get_tesseract_version()
+            self.eng, self.kind = pytesseract, "tesseract"
             return
         except Exception as e:  # noqa
             err = e
         try:
-            import pytesseract
-            pytesseract.get_tesseract_version()
-            self.eng, self.kind = pytesseract, "tess"
+            from rapidocr_onnxruntime import RapidOCR
+            self.eng, self.kind = RapidOCR(), "rapid"
             return
-        except Exception:  # noqa
-            pass
-        raise RuntimeError(f"OCR motoru yüklenemedi: {err}")
+        except Exception as e:  # noqa
+            raise RuntimeError(f"OCR motoru yüklenemedi (Tesseract: {err}; RapidOCR: {e})")
 
     def read(self, img):
         """img: RGB numpy dizisi (tek satır yazı). (metin, güven) döner."""
         self.load()
+        if self.kind == "tesseract":
+            from PIL import Image
+            g = clean_crop(img)
+            txt = self.eng.image_to_string(Image.fromarray(g), lang=self.lang,
+                                           config="--psm 7 -c preserve_interword_spaces=1")
+            return txt.strip(), 1.0
         img = np.pad(img, ((10, 10), (10, 10), (0, 0)), constant_values=255)
-        if self.kind == "rapid":
+        res = None
+        try:
+            res, _ = self.eng(img, use_det=False, use_cls=False, use_rec=True)
+        except Exception:  # noqa
             res = None
-            try:
-                res, _ = self.eng(img, use_det=False, use_cls=False, use_rec=True)
-            except Exception:  # noqa
-                res = None
-            if res:
-                it = res[0]
-                if isinstance(it, (list, tuple)) and len(it) >= 2 and isinstance(it[0], str):
-                    return it[0], float(it[1])
-            res, _ = self.eng(img)
-            if not res:
-                return "", 0.0
-            res = sorted(res, key=lambda r: r[0][0][0])
-            return " ".join(r[1] for r in res), min(float(r[2]) for r in res)
-        from PIL import Image
-        return self.eng.image_to_string(Image.fromarray(img), config="--psm 7").strip(), 1.0
+        if res:
+            it = res[0]
+            if isinstance(it, (list, tuple)) and len(it) >= 2 and isinstance(it[0], str):
+                return it[0], float(it[1])
+        res, _ = self.eng(img)
+        if not res:
+            return "", 0.0
+        res = sorted(res, key=lambda r: r[0][0][0])
+        return " ".join(r[1] for r in res), min(float(r[2]) for r in res)
 
 
 def crop_image(page, rect, zoom=4):
@@ -217,40 +262,79 @@ def place_span(page, s, text):
         put_text(page, x, oy, text, font, size, color, max_width=max(rect.x1 - x, size))
 
 
-def repair_doc(src, pages, ocr, progress=lambda m: None, force=False):
+def learn_maps(pairs):
+    """(yazı tipi, bozuk metin, OCR metni) üçlülerinden karakter eşlemesi öğrenir (oylama)."""
+    votes = {}
+    for font, src, text in pairs:
+        if src and len(src) == len(text):
+            for a, b in zip(src, text):
+                votes.setdefault(font, {}).setdefault(a, Counter())[b] += 1
+    maps = {}
+    for font, d in votes.items():
+        m = {}
+        for a, c in d.items():
+            (b, n), tot = c.most_common(1)[0], sum(c.values())
+            if (n >= 3 and n / tot >= 0.75) or (n == tot and n >= 2):
+                m[a] = b
+        maps[font] = m
+    return maps
+
+
+def decode_span(m, src, text):
+    if src and len(src) == len(text):
+        return "".join(m.get(a, b) for a, b in zip(src, text))
+    if src and all(a in m for a in src):
+        return "".join(m[a] for a in src)
+    return text
+
+
+def repair_doc(src, pages, ocr, progress=lambda m: None, force=False, log=None):
     """Seçili sayfaların kopyasını yapar; bozuk yazı tiplerindeki metni OCR ile düzeltir.
     (yeni belge, düzeltilen span sayısı) döner."""
+    log = log or (lambda m: None)
     out = fitz.open()
     for p in pages:
         out.insert_pdf(src, from_page=p, to_page=p)
     bad = find_bad_fonts(out, range(len(out)), force)
+    log(f"Bozuk yazı tipleri: {sorted(bad)}")
     if not bad:
         return out, 0
-    total = 0
+    log(f"OCR motoru: {ocr.kind or 'yüklenmedi'} / dil: {ocr.lang}")
+    per_page, pairs = [], []
     for pi in range(len(out)):
         page = out[pi]
         jobs = [s for s in iter_spans(page) if s["font"] in bad and s["text"].strip()]
-        results = []
+        res = []
         for k, s in enumerate(jobs, 1):
             progress(f"Sayfa {pages[pi] + 1}: OCR {k}/{len(jobs)}")
             r = fitz.Rect(s["bbox"])
-            rr = fitz.Rect(r.x0 - 1.5, r.y0 - 1, r.x1 + 1.5, r.y1 + 1)
-            text, _score = ocr.read(crop_image(page, rr))
-            results.append((s, clean_ocr(text)))
-        if not results:
+            rr = fitz.Rect(r.x0 - 1.0, r.y0 - 0.5, r.x1 + 1.0, r.y1 + 0.5)
+            text = clean_ocr(ocr.read(crop_image(page, rr))[0])
+            res.append((s, text))
+            pairs.append((s["font"], s["text"].strip(), text))
+        per_page.append(res)
+    maps = learn_maps(pairs)
+    for f, m in maps.items():
+        log(f"Eşleme {f}: {len(m)} karakter öğrenildi")
+    total = 0
+    for pi, res in enumerate(per_page):
+        if not res:
             continue
-        apply_red(page, [s["bbox"] for s, _ in results])
-        for s, text in results:
-            if text:
-                place_span(page, s, text)
+        page = out[pi]
+        apply_red(page, [s["bbox"] for s, _ in res])
+        for s, text in res:
+            final = decode_span(maps.get(s["font"], {}), s["text"].strip(), text)
+            log(f"s{pages[pi] + 1} {s['font']} {s['text']!r} | OCR={text!r} | SON={final!r}")
+            if final:
+                place_span(page, s, final)
                 total += 1
     return out, total
 
 
 # ---------------------------------------------------------------- dönüştürmeler
-def to_word(doc, pages, dst, ocr, progress=lambda m: None, force=False):
+def to_word(doc, pages, dst, ocr, progress=lambda m: None, force=False, log=None):
     from pdf2docx import Converter
-    rep, n = repair_doc(doc, pages, ocr, progress, force)
+    rep, n = repair_doc(doc, pages, ocr, progress, force, log)
     fd, tmp = tempfile.mkstemp(suffix=".pdf")
     os.close(fd)
     try:
@@ -289,9 +373,9 @@ def word_rows(page):
     return out
 
 
-def to_excel(doc, pages, dst, ocr, progress=lambda m: None, force=False):
+def to_excel(doc, pages, dst, ocr, progress=lambda m: None, force=False, log=None):
     import openpyxl
-    rep, n = repair_doc(doc, pages, ocr, progress, force)
+    rep, n = repair_doc(doc, pages, ocr, progress, force, log)
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
     for i in range(len(rep)):

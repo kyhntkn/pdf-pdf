@@ -4,7 +4,7 @@ import traceback
 
 from PySide6.QtCore import QSize, Qt, QThread, Signal, QRect, QPoint
 from PySide6.QtGui import QColor, QIcon, QImage, QPixmap
-from PySide6.QtWidgets import (QApplication, QCheckBox, QColorDialog, QDialog, QFileDialog, QFormLayout, QGroupBox,
+from PySide6.QtWidgets import (QApplication, QCheckBox, QColorDialog, QComboBox, QDialog, QFileDialog, QFormLayout, QGroupBox,
                                QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListView, QListWidget,
                                QListWidgetItem, QMainWindow, QMessageBox, QProgressBar, QPushButton, QRadioButton,
                                QRubberBand, QScrollArea, QSlider, QSpinBox, QVBoxLayout, QWidget)
@@ -264,6 +264,11 @@ class MainWindow(QMainWindow):
                                                     ("JPG", lambda: self.to_img("jpg"))])
         self.force_ocr = QCheckBox("Metni OCR ile oku (zorla)")
         self.sl.addWidget(self.force_ocr)
+        self.lang = QComboBox()
+        self.lang.addItem("OCR dili: İngilizce", "eng")
+        self.lang.addItem("OCR dili: Türkçe", "tur")
+        self.lang.addItem("OCR dili: İngilizce + Türkçe", "eng+tur")
+        self.sl.addWidget(self.lang)
         note = QLabel("Metni bozuk (anlamsız karakterli) PDF’lerde OCR otomatik devreye girer.")
         note.setWordWrap(True)
         note.setStyleSheet("color:#6A7775;font-size:11px;")
@@ -467,8 +472,17 @@ class MainWindow(QMainWindow):
             return
         pages, force, doc = self.sel_pages(), self.force_ocr.isChecked(), self.doc
 
+        self.ocr.lang = self.lang.currentData()
+        logp = os.path.splitext(p)[0] + "-ocr-log.txt"
+        lines = []
+
         def job(progress):
-            return fn(doc, pages, p, progress, force)
+            try:
+                return fn(doc, pages, p, progress, force, lines.append)
+            finally:
+                if lines:
+                    with open(logp, "w", encoding="utf-8") as f:
+                        f.write("\n".join(lines))
 
         def done(n):
             extra = f" ({n} metin parçası OCR ile düzeltildi; kontrol edin)" if n else ""
@@ -478,15 +492,15 @@ class MainWindow(QMainWindow):
 
     def to_word(self):
         self.convert_file(".docx", "Word olarak kaydet",
-                          lambda d, pg, p, pr, f: core.to_word(d, pg, p, self.ocr, pr, f))
+                          lambda d, pg, p, pr, f, lg: core.to_word(d, pg, p, self.ocr, pr, f, lg))
 
     def to_excel(self):
         self.convert_file(".xlsx", "Excel olarak kaydet",
-                          lambda d, pg, p, pr, f: core.to_excel(d, pg, p, self.ocr, pr, f))
+                          lambda d, pg, p, pr, f, lg: core.to_excel(d, pg, p, self.ocr, pr, f, lg))
 
     def to_ppt(self):
         self.convert_file(".pptx", "PowerPoint olarak kaydet",
-                          lambda d, pg, p, pr, f: core.to_pptx(d, pg, p, pr))
+                          lambda d, pg, p, pr, f, lg: core.to_pptx(d, pg, p, pr))
 
     def to_img(self, fmt):
         if not self.need_doc():
