@@ -14,12 +14,26 @@ jobs:
           cache: pip
       - run: python -m pip install --upgrade pip
       - run: pip install -r requirements.txt pyinstaller
+      - name: Tesseract OCR kur ve pakete hazırla
+        shell: pwsh
+        run: |
+          choco install tesseract --no-progress -y
+          $src = "C:\Program Files\Tesseract-OCR"
+          if (-not (Test-Path "$src\tesseract.exe")) { throw "tesseract.exe bulunamadı" }
+          New-Item -ItemType Directory -Force tesseract_bundle | Out-Null
+          Copy-Item "$src\*" tesseract_bundle -Recurse -Force
+          Invoke-WebRequest "https://github.com/tesseract-ocr/tessdata_best/raw/main/eng.traineddata" -OutFile "tesseract_bundle\tessdata\eng.traineddata"
+          Invoke-WebRequest "https://github.com/tesseract-ocr/tessdata_best/raw/main/tur.traineddata" -OutFile "tesseract_bundle\tessdata\tur.traineddata"
+          Get-ChildItem tesseract_bundle\tessdata | Select-Object Name, Length
       - name: Derle
+        shell: pwsh
         run: >
           pyinstaller --noconfirm --windowed --name PDF-Studio
-          --icon assets/icon.ico --add-data "assets;assets"
-          --collect-all rapidocr_onnxruntime --collect-submodules pdf2docx
-          --collect-data pdf2docx --hidden-import fitz
+          --icon assets/icon.ico
+          --add-data "assets;assets"
+          --add-data "tesseract_bundle;tesseract"
+          --collect-submodules pdf2docx --collect-data pdf2docx
+          --hidden-import fitz
           app/main.py
       - name: Zip
         shell: pwsh
