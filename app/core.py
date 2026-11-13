@@ -102,11 +102,14 @@ def garbled(text):
     return letters / len(s) < 0.6 or vowels / max(letters, 1) < 0.18 or weird / len(s) > 0.15
 
 
-def iter_spans(page, clip=None):
-    d = page.get_text("dict", clip=clip) if clip else page.get_text("dict")
+def iter_spans(page, clip=None, raw=False):
+    kind = "rawdict" if raw else "dict"
+    d = page.get_text(kind, clip=clip) if clip else page.get_text(kind)
     for b in d["blocks"]:
         for l in b.get("lines", []):
             for s in l["spans"]:
+                if raw:
+                    s["text"] = "".join(c["c"] for c in s["chars"])
                 yield s
 
 
@@ -142,17 +145,24 @@ def find_tesseract():
 
 
 def clean_crop(img):
-    """Tek satırlık yazı kırpığını Tesseract için hazırlar: gri, koyu yazı/açık zemin, tablo çizgileri silinir."""
+    """Tek satırlık yazı kırpığını Tesseract için hazırlar: gri, koyu yazı/açık zemin,
+    kırpığın kenarına değen tablo çizgileri silinir (harf gövdelerine dokunulmaz)."""
     import cv2
     g = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
     if np.median(g) < 128:  # koyu zeminde açık yazı (ör. kırmızı başlık)
         g = 255 - g
     _, bw = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     h, w = bw.shape
-    hk = cv2.getStructuringElement(cv2.MORPH_RECT, (max(15, int(w * 0.6)), 1))
-    vk = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(15, int(h * 0.7))))
+    hk = cv2.getStructuringElement(cv2.MORPH_RECT, (max(20, int(w * 0.8)), 1))
+    vk = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(20, int(h * 0.92))))
     lines = cv2.bitwise_or(cv2.morphologyEx(bw, cv2.MORPH_OPEN, hk), cv2.morphologyEx(bw, cv2.MORPH_OPEN, vk))
-    lines = cv2.dilate(lines, np.ones((3, 3), np.uint8))
+    edge = np.zeros_like(bw)
+    m = 10
+    edge[:m, :] = 255
+    edge[-m:, :] = 255
+    edge[:, :m] = 255
+    edge[:, -m:] = 255
+    lines = cv2.dilate(cv2.bitwise_and(lines, edge), np.ones((3, 3), np.uint8))
     g = g.copy()
     g[lines > 0] = 255
     return np.pad(g, 12, constant_values=255)
@@ -187,6 +197,38 @@ class OCR:
             return
         except Exception as e:  # noqa
             raise RuntimeError(f"OCR motoru yüklenemedi (Tesseract: {err}; RapidOCR: {e})")
+
+    def read_page(self, img):
+        """Tüm sayfayı okur. [(metin, x0, y0, x1, y1)] (piksel) döner. Yalnızca Tesseract ile."""
+        self.load()
+        if self.kind != "tesseract":
+            return []
+        import cv2
+        from PIL import Image
+        from pytesseract import Output
+        g = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        _, bw = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        hk = cv2.getStructuringElement(cv2.MORPH_RECT, (120, 1))
+        vk = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 120))
+        lines = cv2.bitwise_or(cv2.morphologyEx(bw, cv2.MORPH_OPEN, hk), cv2.morphologyEx(bw, cv2.MORPH_OPEN, vk))
+        thick = cv2.dilate(cv2.morphologyEx(bw, cv2.MORPH_OPEN, np.ones((9, 9), np.uint8)), np.ones((5, 5), np.uint8))
+        lines = cv2.dilate(lines, np.ones((3, 3), np.uint8))
+        lines[thick > 0] = 0  # dolu kırmızı başlık şeritlerine dokunma
+        g = g.copy()
+        g[lines > 0] = 255
+        d = self.eng.image_to_data(Image.fromarray(g), lang=self.lang, output_type=Output.DICT,
+                                   config="-c preserve_interword_spaces=1")
+        out = []
+        for i, t in enumerate(d["text"]):
+            t = (t or "").strip()
+            try:
+                conf = float(d["conf"][i])
+            except (TypeError, ValueError):
+                conf = -1
+            if t and conf >= 30:
+                x, y, w, h = d["left"][i], d["top"][i], d["width"][i], d["height"][i]
+                out.append((t, x, y, x + w, y + h))
+        return out
 
     def read(self, img):
         """img: RGB numpy dizisi (tek satır yazı). (metin, güven) döner."""
@@ -262,6 +304,50 @@ def place_span(page, s, text):
         put_text(page, x, oy, text, font, size, color, max_width=max(rect.x1 - x, size))
 
 
+def page_words(page, ocr, zoom=4):
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+    arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+    words = ocr.read_page(np.ascontiguousarray(arr[:, :, :3]))
+    return [(t, x0 / zoom, y0 / zoom, x1 / zoom, y1 / zoom) for t, x0, y0, x1, y1 in words]
+
+
+def match_words(spans, words):
+    """Sayfa OCR kelimelerini, taban çizgisi (origin) ve yatay aralığa göre span'lara dağıtır."""
+    out = [[] for _ in spans]
+    for t, wx0, wy0, wx1, wy1 in words:
+        if not re.search(r"[A-Za-z0-9ÇĞİÖŞÜçğıöşü]", t):
+            continue
+        h = wy1 - wy0
+        cx = (wx0 + wx1) / 2
+        best = None
+        for i, s in enumerate(spans):
+            oy = s["origin"][1]
+            bx0, _, bx1, _ = s["bbox"]
+            if bx0 - 1.5 <= cx <= bx1 + 1.5 and wy0 + 0.45 * h <= oy <= wy1 + 0.2 * h:
+                d = abs(oy - (wy1 - 0.2 * h))
+                if best is None or d < best[0]:
+                    best = (d, i)
+        if best:
+            out[best[1]].append((wx0, t))
+    return [" ".join(t for _, t in sorted(lst)) for lst in out]
+
+
+def span_size(s):
+    sz = s["size"]
+    if 3 <= sz <= 80:
+        return sz
+    r = fitz.Rect(s["bbox"])
+    return max(4.0, r.height / 1.15)
+
+
+def baseline_crop_rect(s):
+    sz = span_size(s)
+    ox, oy = s["origin"]
+    r = fitz.Rect(s["bbox"])
+    x1 = r.x1 if r.width > 2 else ox + sz * 0.5 * max(1, len(s["text"]))
+    return fitz.Rect(ox - 1.0, oy - sz * 0.9, x1 + 1.0, oy + sz * 0.3)
+
+
 def learn_maps(pairs):
     """(yazı tipi, bozuk metin, OCR metni) üçlülerinden karakter eşlemesi öğrenir (oylama)."""
     votes = {}
@@ -288,9 +374,40 @@ def decode_span(m, src, text):
     return text
 
 
+RUN_RE = re.compile(r"(.)\1{5,}", re.S)
+
+
+def split_span(s):
+    """Span'ı, 6+ kez tekrarlayan karakter dizileri (çizgi/alt çizgi) ve yazı parçaları olarak böler."""
+    chars, text = s.get("chars"), s["text"]
+    if not chars:
+        d = dict(s)
+        d["run"] = False
+        return [d]
+
+    def mk(i, j, run):
+        cs = chars[i:j]
+        bb = [c["bbox"] for c in cs]
+        d = dict(s)
+        d["chars"], d["text"], d["run"] = cs, text[i:j], run
+        d["bbox"] = (min(b[0] for b in bb), min(b[1] for b in bb), max(b[2] for b in bb), max(b[3] for b in bb))
+        d["origin"] = tuple(cs[0]["origin"])
+        return d
+
+    out, pos = [], 0
+    for m in RUN_RE.finditer(text):
+        if m.start() > pos:
+            out.append(mk(pos, m.start(), False))
+        out.append(mk(m.start(), m.end(), True))
+        pos = m.end()
+    if pos < len(text):
+        out.append(mk(pos, len(text), False))
+    return out
+
+
 def repair_doc(src, pages, ocr, progress=lambda m: None, force=False, log=None):
     """Seçili sayfaların kopyasını yapar; bozuk yazı tiplerindeki metni OCR ile düzeltir.
-    (yeni belge, düzeltilen span sayısı) döner."""
+    (yeni belge, düzeltilen parça sayısı) döner."""
     log = log or (lambda m: None)
     out = fitz.open()
     for p in pages:
@@ -299,34 +416,46 @@ def repair_doc(src, pages, ocr, progress=lambda m: None, force=False, log=None):
     log(f"Bozuk yazı tipleri: {sorted(bad)}")
     if not bad:
         return out, 0
-    log(f"OCR motoru: {ocr.kind or 'yüklenmedi'} / dil: {ocr.lang}")
+    ocr.load()
+    log(f"OCR motoru: {ocr.kind} / dil: {ocr.lang}")
     per_page, pairs = [], []
     for pi in range(len(out)):
         page = out[pi]
-        jobs = [s for s in iter_spans(page) if s["font"] in bad and s["text"].strip()]
-        res = []
-        for k, s in enumerate(jobs, 1):
-            progress(f"Sayfa {pages[pi] + 1}: OCR {k}/{len(jobs)}")
-            r = fitz.Rect(s["bbox"])
-            rr = fitz.Rect(r.x0 - 1.0, r.y0 - 0.5, r.x1 + 1.0, r.y1 + 0.5)
-            text = clean_ocr(ocr.read(crop_image(page, rr))[0])
-            res.append((s, text))
-            pairs.append((s["font"], s["text"].strip(), text))
-        per_page.append(res)
+        origs = [s for s in iter_spans(page, raw=True) if s["font"] in bad and s["text"].strip()]
+        items = []
+        for so in origs:
+            for pc in split_span(so):
+                if pc["run"]:
+                    items.append((pc, None))
+                    continue
+                if not pc["text"].strip():
+                    continue
+                progress(f"Sayfa {pages[pi] + 1}: OCR {len(items) + 1}")
+                r = fitz.Rect(pc["bbox"])
+                rr = fitz.Rect(r.x0 - 1.0, r.y0 - 0.5, r.x1 + 1.0, r.y1 + 0.5)
+                text = clean_ocr(ocr.read(crop_image(page, rr))[0])
+                items.append((pc, text))
+                pairs.append((pc["font"], pc["text"].strip(), text))
+        per_page.append((origs, items))
     maps = learn_maps(pairs)
     for f, m in maps.items():
-        log(f"Eşleme {f}: {len(m)} karakter öğrenildi")
+        log(f"Eşleme {f}: {len(m)} karakter öğrenildi: " + "".join(f"{k!r}→{v}  " for k, v in list(m.items())[:60]))
     total = 0
-    for pi, res in enumerate(per_page):
-        if not res:
+    for pi, (origs, items) in enumerate(per_page):
+        if not items:
             continue
         page = out[pi]
-        apply_red(page, [s["bbox"] for s, _ in res])
-        for s, text in res:
-            final = decode_span(maps.get(s["font"], {}), s["text"].strip(), text)
-            log(f"s{pages[pi] + 1} {s['font']} {s['text']!r} | OCR={text!r} | SON={final!r}")
+        apply_red(page, [s["bbox"] for s in origs])
+        for pc, text in items:
+            if pc["run"]:
+                uw = get_font(pc["font"], pc["flags"]).text_length("_", pc["size"]) or 1
+                width = pc["bbox"][2] - pc["bbox"][0]
+                final = "_" * max(3, int(round(width / uw)))
+            else:
+                final = decode_span(maps.get(pc["font"], {}), pc["text"].strip(), text)
+            log(f"s{pages[pi] + 1} {pc['font']} {pc['text'][:40]!r} | OCR={text!r} | SON={final!r}")
             if final:
-                place_span(page, s, final)
+                place_span(page, pc, final)
                 total += 1
     return out, total
 
